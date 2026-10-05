@@ -1,0 +1,214 @@
+// MyRobot-V1.ino
+// This file must be named the same as your sketch folder
+/**
+ * @file Motor.ino
+ * @brief Simple H-bridge motor control helpers.
+ *
+ * Provides a minimal interface for driving a DC motor using
+ * digital GPIO pins (e.g. Arduino-style platforms).
+ *
+ * The motor direction is controlled via two input pins,
+ * while a separate enable pin turns the motor on or off.
+ *
+ * @author Paul Bucci
+ * @date 2026
+ */
+
+// ---------- Pins: match these to YOUR wiring. Enable pins must be PWM (~) pins. ----------
+const int LEFT_IN1 = 2;
+const int LEFT_IN2 = 3;
+const int LEFT_EN = 10;  // PWM
+
+const int RIGHT_IN1 = 4;
+const int RIGHT_IN2 = 5;
+const int RIGHT_EN = 9;  // PWM
+
+const int LEFT_ENCODER = 12;
+const int RIGHT_ENCODER = 11;
+
+// ---------- Speeds (0-255): starting values, then tune ----------
+const int MIN_SPEED = 90;
+const int BASE_SPEED = 180;
+const int LEFT_BASE_SPEED = 185;
+const int RIGHT_BASE_SPEED = 180;
+const int TURN_DIFF = 80;
+
+// ---------- Wheel direction: flip to -1 if that wheel spins backwards on forward() ----------
+const int LEFT_DIR = 1;
+const int RIGHT_DIR = 1;
+
+// Current speed used by serial commands (changed with + and -)
+int speedSetting = BASE_SPEED;
+
+// ---------- Encoder counting ----------
+// Which pin level means "blocked"? If your counts look backwards, flip to LOW.
+const int BLOCKED_STATE = HIGH;
+
+// Print interval for encoder counts (ms)
+const unsigned long ENCODER_PRINT_MS = 250;
+
+volatile long leftBlocked = 0, leftUnblocked = 0;
+volatile long rightBlocked = 0, rightUnblocked = 0;
+
+int lastLeftState, lastRightState;
+unsigned long lastEncoderPrint = 0;
+
+
+// ---------- Original single-motor helpers ----------
+/**
+ * @brief Drives a DC motor in a fixed direction using an H-bridge.
+ *
+ * @param in1 GPIO pin connected to motor driver input 1 (direction control)
+ * @param in2 GPIO pin connected to motor driver input 2 (direction control)
+ * @param enA GPIO pin connected to motor driver enable pin (motor on/off)
+ */
+void drive(int in1, int in2, int enA) {
+  digitalWrite(in1, LOW);   // Direction control: IN1
+  digitalWrite(in2, HIGH);  // Direction control: IN2 (sets rotation direction)
+  digitalWrite(enA, HIGH);  // Enable motor driver
+}
+
+void stop(int in1, int in2, int enA) {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(enA, LOW);  // Disable motor driver
+}
+
+
+// ---------- Driving functions ----------
+void setMotor(int in1, int in2, int en, int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  } else if (speed < 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+  analogWrite(en, abs(speed));
+}
+
+void setWheels(int left, int right) {
+  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN, left * LEFT_DIR);
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, right * RIGHT_DIR);
+}
+
+void forward(int speed = BASE_SPEED) {
+  setWheels(speed, speed);
+}
+void backward(int speed = BASE_SPEED) {
+  setWheels(-speed, -speed);
+}
+
+void turnLeft(int speed = BASE_SPEED, int diff = TURN_DIFF) {
+  setWheels(max(speed - diff, MIN_SPEED), speed);
+}
+void turnRight(int speed = BASE_SPEED, int diff = TURN_DIFF) {
+  setWheels(speed, max(speed - diff, MIN_SPEED));
+}
+
+void spinLeft(int speed = BASE_SPEED) {
+  setWheels(-speed, speed);
+}
+void spinRight(int speed = BASE_SPEED) {
+  setWheels(speed, -speed);
+}
+
+void stopRobot() {
+  setWheels(0, 0);
+}
+
+
+// ---------- Serial command handling ----------
+void handleCommand(char c) {
+  switch (c) {
+    case 'w': forward(speedSetting); break;
+    case 's': backward(speedSetting); break;
+    case 'a': turnLeft(speedSetting); break;
+    case 'd': turnRight(speedSetting); break;
+    case 'q': spinLeft(speedSetting); break;
+    case 'e': spinRight(speedSetting); break;
+    case ' ': stopRobot(); break;
+    case '+': speedSetting = min(speedSetting + 10, 255); break;
+    case '-': speedSetting = max(speedSetting - 10, 0); break;
+    case 'r': resetEncoders(); break;
+  }
+  Serial.print("cmd: ");
+  Serial.print(c);
+  Serial.print("  speed: ");
+  Serial.println(speedSetting);
+}
+
+// ---------- Encoder functions ----------
+void updateEncoders() {
+  int leftState = digitalRead(LEFT_ENCODER);
+  int rightState = digitalRead(RIGHT_ENCODER);
+
+  if (leftState != lastLeftState) {
+    if (leftState == BLOCKED_STATE) leftBlocked++;
+    else leftUnblocked++;
+    lastLeftState = leftState;
+  }
+
+  if (rightState != lastRightState) {
+    if (rightState == BLOCKED_STATE) rightBlocked++;
+    else rightUnblocked++;
+    lastRightState = rightState;
+  }
+}
+
+void printEncoders() {
+  Serial.print("LEFT  blocked: ");
+  Serial.print(leftBlocked);
+  Serial.print("  unblocked: ");
+  Serial.print(leftUnblocked);
+  Serial.print("   |   RIGHT blocked: ");
+  Serial.print(rightBlocked);
+  Serial.print("  unblocked: ");
+  Serial.println(rightUnblocked);
+}
+
+void resetEncoders() {
+  leftBlocked = leftUnblocked = 0;
+  rightBlocked = rightUnblocked = 0;
+}
+
+// ---------- Arduino entry points ----------
+void setup() {
+  Serial.begin(9600);
+
+  // Set motor control pins as outputs
+  pinMode(LEFT_EN, OUTPUT);
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+
+  pinMode(RIGHT_EN, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+
+  pinMode(LEFT_ENCODER, INPUT);
+  pinMode(RIGHT_ENCODER, INPUT);
+  lastLeftState = digitalRead(LEFT_ENCODER);
+  lastRightState = digitalRead(RIGHT_ENCODER);
+
+  stopRobot();
+  Serial.println("Ready. w/s/a/d/q/e = move, space = stop, +/- = speed");
+}
+
+void loop() {
+  updateEncoders();  // must run as often as possible so no transitions are missed
+
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') return;  // ignore Enter
+    handleCommand(c);
+  }
+
+  if (millis() - lastEncoderPrint >= ENCODER_PRINT_MS) {
+    lastEncoderPrint = millis();
+    printEncoders();
+  }
+}
