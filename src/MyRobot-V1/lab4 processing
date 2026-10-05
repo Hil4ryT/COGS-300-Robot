@@ -1,0 +1,37 @@
+import processing.serial.*;
+
+Serial port;
+String lastCmd = "none";
+
+void setup() {
+  size(400, 200);
+  println(Serial.list());               // prints available ports
+  port = new Serial(this, Serial.list()[2], 9600);  // change [0] to your Arduino's index
+  textSize(24);
+  printArray(Serial.list());
+}
+
+void draw() {
+  background(30);
+  fill(255);
+  text("Last command: " + lastCmd, 20, 100);
+}
+
+void keyPressed() {
+  char k = key;
+  if (k == 'w' || k == 's' || k == 'a' || k == 'd' ||
+      k == 'q' || k == 'e' || k == ' ' || k == '+' ||
+      k == '-' || k == 't') {
+    port.write(k);
+    lastCmd = (k == ' ') ? "STOP" : str(k);
+  }
+}
+
+void keyReleased() {
+  // Optional: stop when a movement key is let go (hold-to-drive)
+  if (key == 'w' || key == 's' || key == 'a' || key == 'd' ||
+      key == 'q' || key == 'e') {
+    port.write(' ');
+    lastCmd = "STOP";
+  }
+}
