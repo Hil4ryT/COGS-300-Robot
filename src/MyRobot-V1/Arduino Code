@@ -1,5 +1,12 @@
-
- // MyRobot-V1.ino
+// MyRobot-V2.ino
+// Fixed version with full PID controller
+// Fixes applied:
+//   1. MIN_SPEED floor no longer breaks the PID controller
+//   2. Turn functions no longer reverse at low speeds
+//   3. Non-blocking timing with millis() instead of delay(100)
+//   4. Median-of-3 filter on ultrasonic sensor
+//   5. Manual mode auto-stops after 200ms of no commands
+//   6. Full PID controller implemented with anti-windup
 
 // ---------- Motor pins ----------
 const int LEFT_IN1  = 2;
@@ -15,7 +22,7 @@ const int TRIG_PIN = 6;
 const int ECHO_PIN = 7;
 
 // ---------- Motor settings ----------
-const int MIN_SPEED  = 90;
+const int MIN_SPEED  = 90;   // Below this PWM, motors stall
 const int BASE_SPEED = 180;
 const int TURN_DIFF  = 80;
 
@@ -24,12 +31,31 @@ const int RIGHT_DIR = 1;
 
 int speedSetting = BASE_SPEED;
 
-// ---------- P-controller settings ----------
-const float SET_POINT = 25.0;  // Target distance (cm)
-const float KP = 8.0;          // Proportional gain
-const float TOLERANCE = 2.0;   // Stop within +/- 2 cm
+// ---------- PID controller settings ----------
+const float SET_POINT  = 25.0;   // Target distance (cm)
+const float KP = 8.0;            // Proportional gain
+const float KI = 0.5;            // Integral gain (NEW)
+const float KD = 1.5;            // Derivative gain (NEW)
+const float TOLERANCE = 2.0;     // Deadband: stop within +/- 2 cm
+
+// PID state variables (NEW)
+float integral       = 0.0;
+float lastError      = 0.0;
+unsigned long lastPidTime = 0;   // Timestamp for dt calculation
+
+// Anti-windup limits (NEW)
+const float INTEGRAL_MAX = 200.0;
+const float INTEGRAL_MIN = -200.0;
 
 bool followMode = false;
+
+// ---------- Timing for non-blocking loop (NEW) ----------
+unsigned long lastFollowTime = 0;
+const unsigned long FOLLOW_INTERVAL = 100;  // ms between PID updates
+
+// ---------- Manual mode auto-stop (NEW) ----------
+unsigned long lastCommandTime = 0;
+const unsigned long MANUAL_TIMEOUT = 200;   // ms before auto-stop
 
 // ---------- Motor functions ----------
 void setMotor(int in1, int in2, int en, int speed) {
@@ -52,11 +78,8 @@ void setMotor(int in1, int in2, int en, int speed) {
 }
 
 void setWheels(int left, int right) {
-  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN,
-           left * LEFT_DIR);
-
-  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN,
-           right * RIGHT_DIR);
+  setMotor(LEFT_IN1, LEFT_IN2, LEFT_EN,  left  * LEFT_DIR);
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, right * RIGHT_DIR);
 }
 
 void forward(int speed = BASE_SPEED) {
@@ -67,14 +90,18 @@ void backward(int speed = BASE_SPEED) {
   setWheels(-speed, -speed);
 }
 
-void turnLeft(int speed = BASE_SPEED,
-              int diff = TURN_DIFF) {
-  setWheels(max(speed - diff, MIN_SPEED), speed);
+// FIX #2: Removed the MIN_SPEED floor that could reverse the turn direction.
+// Now we just clamp the slow wheel to >= 0 so it never goes negative
+// (which would reverse it). The robot will turn less sharply at low speeds
+// rather than turning the wrong way.
+void turnLeft(int speed = BASE_SPEED, int diff = TURN_DIFF) {
+  int slowWheel = max(speed - diff, 0);   // Clamp at 0, not MIN_SPEED
+  setWheels(slowWheel, speed);
 }
 
-void turnRight(int speed = BASE_SPEED,
-               int diff = TURN_DIFF) {
-  setWheels(speed, max(speed - diff, MIN_SPEED));
+void turnRight(int speed = BASE_SPEED, int diff = TURN_DIFF) {
+  int slowWheel = max(speed - diff, 0);   // Clamp at 0, not MIN_SPEED
+  setWheels(speed, slowWheel);
 }
 
 void spinLeft(int speed = BASE_SPEED) {
@@ -90,82 +117,149 @@ void stopRobot() {
 }
 
 // ---------- Ultrasonic sensor ----------
-float measureDistance() {
 
+// FIX #4: Added median-of-3 filter to reject noisy readings.
+// Takes 3 measurements and returns the middle value, which ignores
+// one bad outlier reading without slowing down the loop much.
+float measureDistanceRaw() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
-
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
-
   digitalWrite(TRIG_PIN, LOW);
 
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
 
-  // No echo detected
-  if (duration == 0) {
-    return -1;
-  }
-
-  // Convert echo time to cm
-  float distance = duration * 0.0343 / 2.0;
-
-  return distance;
+  if (duration == 0) return -1.0;
+  return duration * 0.0343 / 2.0;
 }
 
-// ---------- P-controller ----------
+float medianOf3(float a, float b, float c) {
+  float arr[3] = {a, b, c};
+  // Simple bubble sort for 3 elements
+  if (arr[0] > arr[1]) { float t = arr[0]; arr[0] = arr[1]; arr[1] = t; }
+  if (arr[1] > arr[2]) { float t = arr[1]; arr[1] = arr[2]; arr[2] = t; }
+  if (arr[0] > arr[1]) { float t = arr[0]; arr[0] = arr[1]; arr[1] = t; }
+  return arr[1];
+}
+
+float measureDistance() {
+  float d1 = measureDistanceRaw();
+  float d2 = measureDistanceRaw();
+  float d3 = measureDistanceRaw();
+
+  // If any reading is invalid, return the first valid one
+  // (or -1 if all are invalid)
+  int validCount = 0;
+  float validSum = 0;
+  float validReadings[3];
+  for (int i = 0; i < 3; i++) {
+    float d = (i == 0) ? d1 : (i == 1) ? d2 : d3;
+    if (d > 0 && d < 200) {
+      validReadings[validCount] = d;
+      validCount++;
+    }
+  }
+  if (validCount == 0) return -1.0;
+  if (validCount == 1) return validReadings[0];
+  if (validCount == 2) return (validReadings[0] + validReadings[1]) / 2.0;
+  return medianOf3(d1, d2, d3);
+}
+
+// ---------- PID controller ----------
+// FIX #1 & #6: Full PID implementation.
+// - Proportional: reacts to current error
+// - Integral:     eliminates steady-state offset (accumulates past error)
+// - Derivative:   damps oscillation by reacting to rate of change of error
+// - Anti-windup:  clamps the integral term so it doesn't blow up
+// - Deadband:     stops the robot when error is within TOLERANCE
+//                instead of forcing MIN_SPEED (which caused oscillation)
+// - MIN_SPEED:   only applied as a "kickstart" when the PID output
+//                is nonzero but too small to move the motors
 void followObject() {
 
   float distance = measureDistance();
 
-  // Stop if measurement is invalid
   if (distance < 0 || distance > 200) {
     stopRobot();
     Serial.println("No valid object detected");
     return;
   }
 
+  // Calculate dt in seconds (needed for integral and derivative)
+  unsigned long now = millis();
+  float dt = (now - lastPidTime) / 1000.0;
+  lastPidTime = now;
+
+  // Avoid division by zero on first iteration
+  if (dt <= 0.0) dt = 0.1;
+
   // Calculate error
   float error = distance - SET_POINT;
 
-  // Calculate proportional output
-  float output = KP * error;
+  // --- P term ---
+  float pTerm = KP * error;
 
-  // Convert output to motor PWM range
-  int motorSpeed = constrain(
-    (int)abs(output), 0, 255
-  );
+  // --- I term (NEW) ---
+  // Accumulate error over time, but only when not in deadband
+  // (prevents integral windup while sitting still in tolerance)
+  if (abs(error) > TOLERANCE) {
+    integral += error * dt;
+  }
+  // Anti-windup: clamp the integral term
+  integral = constrain(integral, INTEGRAL_MIN, INTEGRAL_MAX);
+  float iTerm = KI * integral;
 
-  // Stop when close enough
+  // --- D term (NEW) ---
+  // Rate of change of error. Negative when approaching setpoint (damping).
+  float derivative = (error - lastError) / dt;
+  float dTerm = KD * derivative;
+  lastError = error;
+
+  // --- Total PID output ---
+  float output = pTerm + iTerm + dTerm;
+
+  // Convert to motor PWM range
+  int motorSpeed = constrain((int)abs(output), 0, 255);
+
+  // --- Deadband: stop if close enough ---
+  // FIX #1: No more MIN_SPEED floor inside the deadband.
+  // The robot simply stops. This prevents the bang-bang oscillation
+  // that the original code caused.
   if (abs(error) <= TOLERANCE) {
     stopRobot();
+    // Reset integral when settled to prevent windup from lingering
+    integral = 0.0;
     motorSpeed = 0;
   }
 
-  // Object is too far away
+  // --- Object too far: drive forward ---
   else if (error > 0) {
-    motorSpeed = max(motorSpeed, MIN_SPEED);
+    // FIX #1: Only apply MIN_SPEED as a kickstart if PID says to move
+    // but the value is too small to overcome motor stiction.
+    // This avoids the "jump to 90 PWM" lunge that caused oscillation.
+    if (motorSpeed > 0 && motorSpeed < MIN_SPEED) {
+      motorSpeed = MIN_SPEED;
+    }
     forward(motorSpeed);
   }
 
-  // Object is too close
+  // --- Object too close: drive backward ---
   else {
-    motorSpeed = max(motorSpeed, MIN_SPEED);
+    if (motorSpeed > 0 && motorSpeed < MIN_SPEED) {
+      motorSpeed = MIN_SPEED;
+    }
     backward(motorSpeed);
   }
 
-  // Print controller information
-  Serial.print("Distance: ");
-  Serial.print(distance);
-
-  Serial.print(" cm | Error: ");
-  Serial.print(error);
-
-  Serial.print(" | Output: ");
-  Serial.print(output);
-
-  Serial.print(" | Motor speed: ");
-  Serial.println(motorSpeed);
+  // Print PID debug info
+  Serial.print("Dist: "); Serial.print(distance);
+  Serial.print(" | Err: "); Serial.print(error);
+  Serial.print(" | P: "); Serial.print(pTerm);
+  Serial.print(" | I: "); Serial.print(iTerm);
+  Serial.print(" | D: "); Serial.print(dTerm);
+  Serial.print(" | Out: "); Serial.print(output);
+  Serial.print(" | PWM: "); Serial.println(motorSpeed);
 }
 
 // ---------- Serial commands ----------
@@ -175,6 +269,9 @@ void handleCommand(char c) {
   if (c == ' ') {
     followMode = false;
     stopRobot();
+    // Reset PID state when leaving follow mode
+    integral = 0.0;
+    lastError = 0.0;
     Serial.println("STOPPED");
     return;
   }
@@ -183,7 +280,11 @@ void handleCommand(char c) {
   if (c == 'f') {
     followMode = true;
     stopRobot();
-    Serial.println("Follow Me mode ON");
+    // Reset PID state when entering follow mode
+    integral = 0.0;
+    lastError = 0.0;
+    lastPidTime = millis();
+    Serial.println("Follow Me mode ON (PID)");
     return;
   }
 
@@ -191,6 +292,8 @@ void handleCommand(char c) {
   if (c == 'm') {
     followMode = false;
     stopRobot();
+    integral = 0.0;
+    lastError = 0.0;
     Serial.println("Manual mode ON");
     return;
   }
@@ -200,6 +303,10 @@ void handleCommand(char c) {
     Serial.println("Press m for manual mode");
     return;
   }
+
+  // FIX #5: Record the time of every valid manual command
+  // so the main loop can auto-stop after MANUAL_TIMEOUT ms
+  lastCommandTime = millis();
 
   switch (c) {
     case 'w': forward(speedSetting); break;
@@ -226,29 +333,25 @@ void handleCommand(char c) {
 
 // ---------- Setup ----------
 void setup() {
-
   Serial.begin(9600);
 
-  // Motor pins
   pinMode(LEFT_EN, OUTPUT);
   pinMode(LEFT_IN1, OUTPUT);
   pinMode(LEFT_IN2, OUTPUT);
-
   pinMode(RIGHT_EN, OUTPUT);
   pinMode(RIGHT_IN1, OUTPUT);
   pinMode(RIGHT_IN2, OUTPUT);
-
-  // Sensor pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
   stopRobot();
 
-  Serial.println("Robot ready!");
-  Serial.println("f = Follow Me mode");
+  Serial.println("Robot ready! (PID version)");
+  Serial.println("f = Follow Me mode (PID)");
   Serial.println("m = Manual mode");
   Serial.println("space = Stop");
   Serial.println("w/s/a/d/q/e = Movement");
+  Serial.println("+/- = Adjust speed");
 }
 
 // ---------- Main loop ----------
@@ -257,15 +360,28 @@ void loop() {
   // Read serial commands
   if (Serial.available() > 0) {
     char c = Serial.read();
-
     if (c != '\n' && c != '\r') {
       handleCommand(c);
     }
   }
 
-  // Run automatic P-controller
+  // FIX #3: Non-blocking timing instead of delay(100).
+  // The loop runs continuously, so serial commands are processed
+  // immediately even while in follow mode.
   if (followMode) {
-    followObject();
-    delay(100);
+    unsigned long now = millis();
+    if (now - lastFollowTime >= FOLLOW_INTERVAL) {
+      lastFollowTime = now;
+      followObject();
+    }
+  }
+
+  // FIX #5: Auto-stop in manual mode if no command received recently.
+  // This makes manual control feel more like a joystick — the robot
+  // only moves while you're actively sending commands.
+  else {
+    if (millis() - lastCommandTime > MANUAL_TIMEOUT) {
+      stopRobot();
+    }
   }
 }
