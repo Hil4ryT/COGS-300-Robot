@@ -1,0 +1,220 @@
+// Left-wall following: P controller + 90 degree inside/outside corners.
+// L298N + 2 DC motors, 2 ultrasonic sensors (front, left).
+// Tuned starting values: follow the tuning steps to refine them.
+
+// ---------- Pins ----------
+const int LEFT_ENCODER_PIN  = 2;   // not used yet
+const int RIGHT_ENCODER_PIN = 3;   // not used yet
+
+const int FRONT_TRIG = 11;
+const int FRONT_ECHO = 12;
+const int LEFT_TRIG  = 6;
+const int LEFT_ECHO  = 13;
+
+const int MIN_SPEED = 90;
+const int LEFT_DIR  = 1;           // 1 = normal, -1 = reversed wiring
+const int RIGHT_DIR = 1;
+
+const int LEFT_IN1  = 5;
+const int LEFT_IN2  = 4;
+const int LEFT_EN   = 9;
+
+const int RIGHT_IN1 = 7;
+const int RIGHT_IN2 = 8;
+const int RIGHT_EN  = 10;
+
+// ---------- Tunables: straight wall (P controller) ----------
+const int   LEFT_SPEED  = 157.5;     // base PWM per wheel (wheel trim, tune in step 1)
+const int   RIGHT_SPEED = 200;
+const float TARGET_DIST_CM = 20.0; // distance to hold from the left wall
+const float KP     = 2.5;          // gain when too FAR from wall (steer toward it)
+const float KP_OUT = 4;          // gain when too CLOSE to wall (steer away)
+const int   MAX_CORRECTION = 70;   // limit on steering correction
+
+// ---------- Tunables: corners ----------
+const float WALL_LOST_CM   = 40.0; // left reading above this = no wall
+const int   LOST_COUNT_MAX = 3;    // consecutive "no wall" reads before outside turn
+const float FRONT_TURN_CM  = 25.0; // front closer than this = inside corner
+const float FRONT_CLEAR_CM = 35.0; // front must be this clear to end inside turn
+
+const int   TURN_SPEED      = 175; // spin speed for inside turn
+const int   ARC_LEFT_SPEED  = 90;  // outside turn arc: slow left wheel...
+const int   ARC_RIGHT_SPEED = 220; // ...fast right wheel
+
+const unsigned long OUTSIDE_FORWARD_MS = 500;  // drive straight past the corner first
+const unsigned long TURN_TIMEOUT_MS    = 2500; // give up if a turn takes too long
+
+const unsigned long ECHO_TIMEOUT_US = 30000;   // ~5 m max
+
+// ---------- State machine ----------
+enum State { IDLE, FOLLOW, INSIDE_TURN, OUTSIDE_FORWARD, OUTSIDE_ARC, STOPPED };
+State state = IDLE;
+int lostCount = 0;
+int lastCorr = 0;                  // for Serial debugging
+unsigned long stateStart = 0;
+
+void setState(State s) {
+  state = s;
+  stateStart = millis();
+}
+
+// ---------- Ultrasonic ----------
+// Returns distance in cm, or 999 if no echo (nothing in range).
+float readDistanceCm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return 999.0;
+  return duration * 0.0343 / 2.0;   // speed of sound in air, cm/us
+}
+
+// ---------- Motors ----------
+// speed: -255..255 (sign = direction)
+void setMotor(int in1, int in2, int en, int dirSign, int speed) {
+  speed *= dirSign;
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+  analogWrite(en, constrain(abs(speed), 0, 255));
+}
+
+// Both wheels forward, clamped to [MIN_SPEED, 255].
+void drive(int leftSpeed, int rightSpeed) {
+  leftSpeed  = constrain(leftSpeed,  MIN_SPEED, 255);
+  rightSpeed = constrain(rightSpeed, MIN_SPEED, 255);
+  setMotor(LEFT_IN1,  LEFT_IN2,  LEFT_EN,  LEFT_DIR,  leftSpeed);
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, RIGHT_DIR, rightSpeed);
+}
+
+// Spin in place to the right (left wheel forward, right wheel backward).
+void spinRight(int speed) {
+  setMotor(LEFT_IN1,  LEFT_IN2,  LEFT_EN,  LEFT_DIR,   speed);
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, RIGHT_DIR, -speed);
+}
+
+void stopMotors() {
+  setMotor(LEFT_IN1,  LEFT_IN2,  LEFT_EN,  LEFT_DIR,  0);
+  setMotor(RIGHT_IN1, RIGHT_IN2, RIGHT_EN, RIGHT_DIR, 0);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+
+  pinMode(LEFT_ENCODER_PIN, INPUT_PULLUP);
+  pinMode(RIGHT_ENCODER_PIN, INPUT_PULLUP);
+
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(LEFT_EN, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+  pinMode(RIGHT_EN, OUTPUT);
+
+  stopMotors();
+  setState(IDLE);
+}
+
+// ---------- Main loop ----------
+void loop() {
+  float leftDist  = readDistanceCm(LEFT_TRIG, LEFT_ECHO);
+  delay(30);  // let the first ping die out before the next one
+  float frontDist = readDistanceCm(FRONT_TRIG, FRONT_ECHO);
+
+  bool wallPresent = (leftDist < WALL_LOST_CM);
+  unsigned long elapsed = millis() - stateStart;
+
+  switch (state) {
+
+    case IDLE:
+      // stay still until a wall is on the left and the front is clear
+      stopMotors();
+      if (wallPresent && frontDist > FRONT_TURN_CM) {
+        lostCount = 0;
+        setState(FOLLOW);
+      }
+      break;
+
+    case FOLLOW:
+      if (frontDist < FRONT_TURN_CM) {
+        // inside corner: wall ahead
+        setState(INSIDE_TURN);
+      } else if (!wallPresent) {
+        // outside corner: wall disappeared (debounced)
+        if (++lostCount >= LOST_COUNT_MAX) setState(OUTSIDE_FORWARD);
+      } else {
+        lostCount = 0;
+        // error > 0: too far from wall -> steer left (toward it)
+        // error < 0: too close        -> steer right (away), with stronger gain
+        float error = leftDist - TARGET_DIST_CM;
+        float gain  = (error < 0) ? KP_OUT : KP;
+        lastCorr = constrain((int)(gain * error), -MAX_CORRECTION, MAX_CORRECTION);
+        drive(LEFT_SPEED - lastCorr, RIGHT_SPEED + lastCorr);
+      }
+      break;
+
+    case INSIDE_TURN:
+      // spin right until the front is clear and the new wall is on the left
+      spinRight(TURN_SPEED);
+      if (frontDist > FRONT_CLEAR_CM && wallPresent) {
+        lostCount = 0;
+        setState(FOLLOW);
+      } else if (elapsed > TURN_TIMEOUT_MS) {
+        setState(STOPPED);
+      }
+      break;
+
+    case OUTSIDE_FORWARD:
+      // drive straight so the robot's body clears the corner
+      drive(LEFT_SPEED, RIGHT_SPEED);
+      if (frontDist < FRONT_TURN_CM) {
+        setState(INSIDE_TURN);           // something ahead, play it safe
+      } else if (elapsed > OUTSIDE_FORWARD_MS) {
+        setState(OUTSIDE_ARC);
+      }
+      break;
+
+    case OUTSIDE_ARC:
+      // curve left around the corner until the wall is found again
+      drive(ARC_LEFT_SPEED, ARC_RIGHT_SPEED);
+      if (wallPresent) {
+        lostCount = 0;
+        setState(FOLLOW);
+      } else if (frontDist < FRONT_TURN_CM) {
+        setState(INSIDE_TURN);
+      } else if (elapsed > TURN_TIMEOUT_MS) {
+        setState(STOPPED);
+      }
+      break;
+
+    case STOPPED:
+      // failsafe: a turn took too long. Stop, then wait for a wall again.
+      stopMotors();
+      lostCount = 0;
+      setState(IDLE);
+      break;
+  }
+
+  Serial.print("state: ");  Serial.print(state);
+  Serial.print("  L: ");    Serial.print(leftDist);
+  Serial.print("  F: ");    Serial.print(frontDist);
+  Serial.print("  corr: "); Serial.println(lastCorr);
+
+  delay(30);
+}
