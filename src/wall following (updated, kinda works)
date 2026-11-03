@@ -26,25 +26,25 @@ const int RIGHT_EN  = 10;
 // ---------- Tunables: straight wall (P controller) ----------
 const int   LEFT_SPEED  = 157.5;     // base PWM per wheel (wheel trim, tune in step 1)
 const int   RIGHT_SPEED = 200;
-const float TARGET_DIST_CM = 20.0; // distance to hold from the left wall
-const float KP     = 2.5;          // gain when too FAR from wall (steer toward it)
+const float TARGET_DIST_CM = 20; // distance to hold from the left wall
+const float KP     = 2;          // gain when too FAR from wall (steer toward it)
 const float KP_OUT = 4;          // gain when too CLOSE to wall (steer away)
-const int   MAX_CORRECTION = 70;   // limit on steering correction
+const int   MAX_CORRECTION = 40;   // limit on steering correction
 
 // ---------- Tunables: corners ----------
-const float WALL_LOST_CM   = 40.0; // left reading above this = no wall
-const int   LOST_COUNT_MAX = 3;    // consecutive "no wall" reads before outside turn
+const float WALL_LOST_CM   = 35.0; // left reading above this = no wall
+const int   LOST_COUNT_MAX = 2;    // consecutive "no wall" reads before outside turn
 const float FRONT_TURN_CM  = 25.0; // front closer than this = inside corner
 const float FRONT_CLEAR_CM = 35.0; // front must be this clear to end inside turn
 
 const int   TURN_SPEED      = 175; // spin speed for inside turn
-const int   ARC_LEFT_SPEED  = 90;  // outside turn arc: slow left wheel...
+const int   ARC_LEFT_SPEED  = 45;  // outside turn arc: slow left wheel...
 const int   ARC_RIGHT_SPEED = 220; // ...fast right wheel
 
-const unsigned long OUTSIDE_FORWARD_MS = 500;  // drive straight past the corner first
-const unsigned long TURN_TIMEOUT_MS    = 2500; // give up if a turn takes too long
+const unsigned long OUTSIDE_FORWARD_MS = 0;  // drive straight past the corner first
+const unsigned long TURN_TIMEOUT_MS    = 5000; // give up if a turn takes too long
 
-const unsigned long ECHO_TIMEOUT_US = 30000;   // ~5 m max
+const unsigned long ECHO_TIMEOUT_US = 12000;   // ~5 m max
 
 // ---------- State machine ----------
 enum State { IDLE, FOLLOW, INSIDE_TURN, OUTSIDE_FORWARD, OUTSIDE_ARC, STOPPED };
@@ -160,6 +160,7 @@ void loop() {
         if (++lostCount >= LOST_COUNT_MAX) setState(OUTSIDE_FORWARD);
       } else {
         lostCount = 0;
+        // *P-CONTROLLER HERE*
         // error > 0: too far from wall -> steer left (toward it)
         // error < 0: too close        -> steer right (away), with stronger gain
         float error = leftDist - TARGET_DIST_CM;
@@ -218,3 +219,4 @@ void loop() {
 
   delay(30);
 }
+
