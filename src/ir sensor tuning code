@@ -1,0 +1,110 @@
+// IR line sensor tuning tool (3 sensors: left, center, right).
+// Upload this alone (no motors). Open Serial Monitor at 9600 baud, "Newline" line ending.
+//
+// Live mode (default): prints raw analog values, the module's digital output,
+//                      and the L C R tape pattern using the current thresholds.
+// Send 'c' : 5-second calibration sweep. Slide the sensors back and forth across
+//            the tape and floor during the sweep. It records min/max per sensor and
+//            suggests thresholds.
+// Send 'h' : flips which side of the threshold counts as tape (TAPE_IS_HIGH).
+//
+// Wiring: sensor AO (analog out) -> A0/A1/A2. Digital out (DO) can go to the same pin
+// if your module has no AO; analog values will then just read near 0 or 1023.
+
+const int IR_PINS[3] = { A0, A1, A2 };
+const char NAMES[3]  = { 'L', 'C', 'R' };
+
+int  thresh[3]    = { 512, 512, 512 };   // paste the suggested values here after calibrating
+bool TAPE_IS_HIGH = true;                // true: tape reads ABOVE threshold; false: below
+
+const unsigned long SWEEP_MS = 5000;
+
+int readAvg(int pin) {                    // average 5 reads to smooth noise
+  long sum = 0;
+  for (int i = 0; i < 5; i++) sum += analogRead(pin);
+  return sum / 5;
+}
+
+bool isTape(int i, int v) {
+  return TAPE_IS_HIGH ? (v > thresh[i]) : (v < thresh[i]);
+}
+
+void calibrate() {
+  int mn[3] = { 1023, 1023, 1023 };
+  int mx[3] = { 0, 0, 0 };
+
+  Serial.println();
+  Serial.println("Sweeping for 5 s... slide the sensors across tape AND floor now.");
+  unsigned long t0 = millis();
+  while (millis() - t0 < SWEEP_MS) {
+    for (int i = 0; i < 3; i++) {
+      int v = readAvg(IR_PINS[i]);
+      if (v < mn[i]) mn[i] = v;
+      if (v > mx[i]) mx[i] = v;
+    }
+    delay(5);
+  }
+
+  Serial.println("Results (min / max / suggested threshold / contrast):");
+  for (int i = 0; i < 3; i++) {
+    thresh[i] = (mn[i] + mx[i]) / 2;
+    Serial.print(NAMES[i]); Serial.print(":  ");
+    Serial.print(mn[i]);    Serial.print(" / ");
+    Serial.print(mx[i]);    Serial.print(" / ");
+    Serial.print(thresh[i]); Serial.print(" / ");
+    Serial.print(mx[i] - mn[i]);
+    if (mx[i] - mn[i] < 150) Serial.print("   <-- LOW CONTRAST: lower the sensor or adjust its pot");
+    Serial.println();
+  }
+  Serial.println();
+  Serial.print("Paste into your sketch:  int thresh[3] = { ");
+  Serial.print(thresh[0]); Serial.print(", ");
+  Serial.print(thresh[1]); Serial.print(", ");
+  Serial.print(thresh[2]); Serial.println(" };");
+  Serial.println("Then put each sensor over tape in live mode and check polarity (send 'h' to flip).");
+  Serial.println();
+}
+
+void setup() {
+  Serial.begin(9600);
+  for (int i = 0; i < 3; i++) pinMode(IR_PINS[i], INPUT);
+  Serial.println("IR tuning ready.  'c' = calibrate sweep,  'h' = flip tape polarity");
+}
+
+void loop() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'c') calibrate();
+    if (ch == 'h') {
+      TAPE_IS_HIGH = !TAPE_IS_HIGH;
+      Serial.print("Tape is now treated as: ");
+      Serial.println(TAPE_IS_HIGH ? "HIGH (above threshold)" : "LOW (below threshold)");
+    }
+  }
+
+  int  v[3];
+  bool t[3];
+  for (int i = 0; i < 3; i++) {
+    v[i] = readAvg(IR_PINS[i]);
+    t[i] = isTape(i, v[i]);
+  }
+
+  // raw analog values
+  Serial.print("raw  L:"); Serial.print(v[0]);
+  Serial.print("  C:");    Serial.print(v[1]);
+  Serial.print("  R:");    Serial.print(v[2]);
+
+  // digital state of the same pins (compare with the module's onboard LED)
+  Serial.print("   | DO  ");
+  Serial.print(digitalRead(IR_PINS[0]));
+  Serial.print(digitalRead(IR_PINS[1]));
+  Serial.print(digitalRead(IR_PINS[2]));
+
+  // tape pattern using thresholds (1 = tape)
+  Serial.print("   | tape  ");
+  Serial.print(t[0]); Serial.print(' ');
+  Serial.print(t[1]); Serial.print(' ');
+  Serial.println(t[2]);
+
+  delay(100);
+}
