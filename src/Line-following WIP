@@ -1,0 +1,327 @@
+
+/*
+  LAB 07 - THREE SENSOR LINE FOLLOWING
+  Arduino R4 + L298N + 3 IR Sensors
+
+  Automatically follows white tape.
+  Uses calibrated analog thresholds.
+
+  No Processing required.
+*/
+
+// ========== MOTOR PINS ==========
+
+const int LEFT_IN1 = 4;
+const int LEFT_IN2 = 5;
+const int LEFT_EN = 9;
+
+const int RIGHT_IN1 = 7;
+const int RIGHT_IN2 = 8;
+const int RIGHT_EN = 10;
+
+// ========== IR SENSOR PINS ==========
+
+const int IR_PINS[3] = {A0, A1, A2};
+
+// Replace with values from calibration
+int thresh[3] = {512, 512, 512};
+
+// true = white tape gives higher readings
+// false = white tape gives lower readings
+bool TAPE_IS_HIGH = true;
+
+// ========== MOTOR SETTINGS ==========
+
+const int LEFT_DIR = 1;
+const int RIGHT_DIR = 1;
+
+const int BASE_LEFT = 150;
+const int BASE_RIGHT = 170;
+
+const int TURN_SPEED = 160;
+const int SLOW_SPEED = 95;
+const int SEARCH_SPEED = 125;
+
+// ========== LINE RECOVERY ==========
+
+const unsigned long SEARCH_TIMEOUT = 1500;
+
+int lastDirection = 0;
+// -1 = left
+//  1 = right
+//  0 = unknown
+
+unsigned long lostLineTime = 0;
+bool searching = false;
+bool stopped = false;
+
+// ========== SENSOR FUNCTIONS ==========
+
+// Average 5 analog readings
+int readAvg(int pin) {
+  long sum = 0;
+
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(pin);
+  }
+
+  return sum / 5;
+}
+
+// Determine whether sensor detects tape
+bool isTape(int i, int value) {
+  if (TAPE_IS_HIGH) {
+    return value > thresh[i];
+  }
+  else {
+    return value < thresh[i];
+  }
+}
+
+// ========== MOTOR FUNCTIONS ==========
+
+void setMotor(int in1, int in2, int en, int speed) {
+
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  }
+  else if (speed < 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  }
+  else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  analogWrite(en, abs(speed));
+}
+
+void setWheels(int left, int right) {
+
+  setMotor(
+    LEFT_IN1,
+    LEFT_IN2,
+    LEFT_EN,
+    left * LEFT_DIR
+  );
+
+  setMotor(
+    RIGHT_IN1,
+    RIGHT_IN2,
+    RIGHT_EN,
+    right * RIGHT_DIR
+  );
+}
+
+// ========== MOVEMENT FUNCTIONS ==========
+
+void forward() {
+  setWheels(BASE_LEFT, BASE_RIGHT);
+}
+
+void turnLeft() {
+  setWheels(SLOW_SPEED, TURN_SPEED);
+}
+
+void turnRight() {
+  setWheels(TURN_SPEED, SLOW_SPEED);
+}
+
+void sharpLeft() {
+  setWheels(-SEARCH_SPEED, SEARCH_SPEED);
+}
+
+void sharpRight() {
+  setWheels(SEARCH_SPEED, -SEARCH_SPEED);
+}
+
+void stopRobot() {
+  setWheels(0, 0);
+}
+
+// ========== LINE FOLLOWING ==========
+
+void lineFollow() {
+
+  if (stopped) {
+    stopRobot();
+    return;
+  }
+
+  // Read sensors
+  int values[3];
+  bool tape[3];
+
+  for (int i = 0; i < 3; i++) {
+    values[i] = readAvg(IR_PINS[i]);
+    tape[i] = isTape(i, values[i]);
+  }
+
+  bool L = tape[0];
+  bool C = tape[1];
+  bool R = tape[2];
+
+  // Print sensor pattern
+  Serial.print("Tape: ");
+  Serial.print(L);
+  Serial.print(" ");
+  Serial.print(C);
+  Serial.print(" ");
+  Serial.println(R);
+
+  // ========== CENTERED ==========
+
+  if (!L && C && !R) {
+
+    forward();
+
+    searching = false;
+    lastDirection = 0;
+
+    Serial.println("FORWARD");
+  }
+
+  // ========== LEFT SIDE ==========
+
+  else if (L && C && !R) {
+
+    turnLeft();
+
+    lastDirection = -1;
+    searching = false;
+
+    Serial.println("LEFT");
+  }
+
+  else if (L && !C && !R) {
+
+    sharpLeft();
+
+    lastDirection = -1;
+    searching = false;
+
+    Serial.println("SHARP LEFT");
+  }
+
+  // ========== RIGHT SIDE ==========
+
+  else if (!L && C && R) {
+
+    turnRight();
+
+    lastDirection = 1;
+    searching = false;
+
+    Serial.println("RIGHT");
+  }
+
+  else if (!L && !C && R) {
+
+    sharpRight();
+
+    lastDirection = 1;
+    searching = false;
+
+    Serial.println("SHARP RIGHT");
+  }
+
+  // ========== ALL SENSORS SEE TAPE ==========
+
+  else if (L && C && R) {
+
+    forward();
+
+    searching = false;
+
+    Serial.println("ALL WHITE - FORWARD");
+  }
+
+  // ========== LEFT AND RIGHT SEE TAPE ==========
+
+  else if (L && !C && R) {
+
+    forward();
+
+    searching = false;
+
+    Serial.println("INTERSECTION");
+  }
+
+  // ========== LINE LOST ==========
+
+  else {
+
+    if (!searching) {
+      searching = true;
+      lostLineTime = millis();
+    }
+
+    if (millis() - lostLineTime > SEARCH_TIMEOUT) {
+
+      stopRobot();
+      stopped = true;
+
+      Serial.println("LINE LOST - STOPPED");
+      return;
+    }
+
+    if (lastDirection == -1) {
+
+      sharpLeft();
+      Serial.println("SEARCH LEFT");
+    }
+
+    else if (lastDirection == 1) {
+
+      sharpRight();
+      Serial.println("SEARCH RIGHT");
+    }
+
+    else {
+
+      stopRobot();
+      Serial.println("WAITING FOR LINE");
+    }
+  }
+}
+
+// ========== SETUP ==========
+
+void setup() {
+
+  Serial.begin(9600);
+
+  // Motor pins
+  pinMode(LEFT_IN1, OUTPUT);
+  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(LEFT_EN, OUTPUT);
+
+  pinMode(RIGHT_IN1, OUTPUT);
+  pinMode(RIGHT_IN2, OUTPUT);
+  pinMode(RIGHT_EN, OUTPUT);
+
+  // IR sensor pins
+  for (int i = 0; i < 3; i++) {
+    pinMode(IR_PINS[i], INPUT);
+  }
+
+  stopRobot();
+
+  Serial.println("LAB 07 LINE FOLLOWING");
+  Serial.println("Starting in 3 seconds...");
+
+  delay(3000);
+}
+
+// ========== MAIN LOOP ==========
+
+void loop() {
+
+  lineFollow();
+
+  delay(20);
+}
