@@ -1,0 +1,648 @@
+// Line following -> left-wall following, in one sketch (Arduino UNO R4, L298N, 2 encoders).
+//
+// SECTION 1: LINE   3 front IR sensors, encoder-based wheel speed control (rev/s).
+// SECTION 2: WALL   left-wall P controller + inside/outside corners, 2 ultrasonic
+//                   sensors (front, left), plain PWM (0..255).
+//
+// TRANSITION line -> wall: the line code is STOPPED (no line found, see below) and
+// the middle sensor still sees nothing for LINE_END_MS. Change lineSectionOver()
+// if your course has a better cue (e.g. a marker on the floor). There is no
+// transition back from wall to line.
+//
+// Both sections share the same motor pins, so only one of them drives at a time.
+// The wall section does NOT call updateSpeedControl() (it uses raw PWM).
+//
+// Serial Monitor: 115200.
+
+// =====================================================================
+// SECTION SWITCH
+// =====================================================================
+enum Section { SEC_LINE, SEC_WALL };
+Section section = SEC_LINE;
+
+const bool START_IN_WALL = false;           // true = skip the line section (for testing the wall code)
+const unsigned long LINE_END_MS = 500;      // STOPPED with no line this long = line section over
+unsigned long lineLostSince = 0;
+
+// =====================================================================
+// LINE FOLLOWING
+// =====================================================================
+// Line following with the three front IR sensors (left / middle / right).
+//
+// LINE FOLLOWING
+// Drive forward keeping the middle sensor over the line. If an outer sensor
+// sees the line, the robot has drifted, so it does a slight, brief curve
+// (CURVE for at least CORRECT_MS) to straighten out, then goes straight again.
+//
+// LINE TURNING
+// Starts when all three sensors see nothing (end of a segment). It looks at
+// which outer sensor was on most recently (however long ago):
+//   left was last  -> rotate left in place until the middle sees the line
+//   right was last -> rotate right in place until the middle sees the line
+//   neither        -> stop (no outer sensor has been on yet, or both went
+//                     off at the same moment, e.g. a T)
+// Then it goes back to LINE FOLLOWING. As a safety net it also stops if a
+// rotation goes on longer than TURN_TIMEOUT_MS without finding the line.
+//
+// Wheel speeds are in rev/s and held by the encoders (speed control below).
+
+// ---- IR sensors (front) ----
+const int IR_LEFT = A0;
+const int IR_MID = A1;
+const int IR_RIGHT = A2;
+
+// These modules read LOW over the black line (HIGH over white). Check with SENSOR_TEST:
+// over the line a sensor should print 1, over white 0.
+const bool LINE_IS_HIGH = false;
+
+// ---- tuning (wheel speeds in rev/s; 1 rev = 20 encoder slots) ----
+const float BASE = 1.3;                      // forward speed while following
+const float CURVE = 0.5;                     // added to one wheel and taken from the other during a correction
+const float TURN_SPEED = 0.8;                // each wheel's speed (opposite directions) when rotating in place
+const unsigned long CORRECT_MS = 100;        // minimum length of one correction curve
+const unsigned long TURN_TIMEOUT_MS = 4000;  // give up rotating after this long (about a full spin)
+
+// true = curve TOWARD the side that sees the line (left sensor on -> curve left).
+// false = curve AWAY from it.
+const bool STEER_TOWARD_LINE = true;
+
+const bool SENSOR_TEST = false;  // true = motors off, print L M R (1 = on the line) every 200 ms
+const bool ENC_TEST = false;     // true = wiring check: one motor at a time, prints each encoder
+const bool SPEED_TEST = false;   // true = ignore the line, drive both wheels at BASE and print speeds for tuning
+
+// ---- line state ----
+enum Mode { FOLLOWING,
+            TURNING_LEFT,
+            TURNING_RIGHT,
+            STOPPED };
+Mode mode = FOLLOWING;
+
+int lastSide = 0;                // outer sensor that was on most recently: -1 left, +1 right, 0 neither
+int correctDir = 0;              // current correction: -1 curve left, +1 curve right, 0 straight
+unsigned long correctUntil = 0;  // correction keeps going until this time
+unsigned long turnStart = 0;     // when the current rotation started
+
+// =====================================================================
+// WALL FOLLOWING  (constants/names prefixed WALL_ / wall to avoid clashes)
+// =====================================================================
+// Left-wall following: P controller + 90 degree inside/outside corners.
+
+// ---------- Pins ----------
+const int FRONT_TRIG = 11;
+const int FRONT_ECHO = 12;
+const int LEFT_TRIG = 6;
+const int LEFT_ECHO = 13;
+
+const int WALL_MIN_SPEED = 90;
+const int LEFT_DIR = 1;   // 1 = normal, -1 = reversed wiring
+const int RIGHT_DIR = 1;
+
+// ---------- Tunables: straight wall (P controller) ----------
+const int WALL_LEFT_SPEED = 157;   // base PWM per wheel (wheel trim)
+const int WALL_RIGHT_SPEED = 200;
+const float TARGET_DIST_CM = 20;   // distance to hold from the left wall
+const float WALL_KP = 2;           // gain when too FAR from wall (steer toward it)
+const float WALL_KP_OUT = 4;       // gain when too CLOSE to wall (steer away)
+const int MAX_CORRECTION = 40;     // limit on steering correction
+
+// ---------- Tunables: corners ----------
+const float WALL_LOST_CM = 35.0;   // left reading above this = no wall
+const int LOST_COUNT_MAX = 2;      // consecutive "no wall" reads before outside turn
+const float FRONT_TURN_CM = 25.0;  // front closer than this = inside corner
+const float FRONT_CLEAR_CM = 35.0; // front must be this clear to end inside turn
+
+const int WALL_TURN_SPEED = 175;   // spin speed for inside turn
+const int ARC_LEFT_SPEED = 45;     // outside turn arc: slow left wheel...
+const int ARC_RIGHT_SPEED = 220;   // ...fast right wheel
+
+const unsigned long OUTSIDE_FORWARD_MS = 0;     // drive straight past the corner first
+const unsigned long WALL_TURN_TIMEOUT_MS = 5000;  // give up if a turn takes too long
+const unsigned long ECHO_TIMEOUT_US = 12000;    // ~5 m max
+
+// ---------- Wall state machine ----------
+enum WallState { WALL_IDLE,
+                 WALL_FOLLOW,
+                 WALL_INSIDE_TURN,
+                 WALL_OUTSIDE_FORWARD,
+                 WALL_OUTSIDE_ARC,
+                 WALL_STOPPED };
+WallState wallState = WALL_IDLE;
+int wallLostCount = 0;
+int wallLastCorr = 0;  // for Serial debugging
+unsigned long wallStateStart = 0;
+
+// =====================================================================
+// SETUP / LOOP
+// =====================================================================
+void setup() {
+  pinMode(IR_LEFT, INPUT);
+  pinMode(IR_MID, INPUT);
+  pinMode(IR_RIGHT, INPUT);
+
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  pinMode(LEFT_TRIG, OUTPUT);
+  pinMode(LEFT_ECHO, INPUT);
+
+  initSpeedControl();  // motor pins + encoder interrupts
+  Serial.begin(115200);
+
+  if (START_IN_WALL) startWallSection();
+}
+
+void loop() {
+  if (ENC_TEST) {
+    runEncoderTest();
+    return;
+  }  // wiring check, bypasses everything else
+
+  if (SENSOR_TEST) {  // sensor check, motors stay off
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 200) {
+      lastPrint = millis();
+      Serial.print("L ");
+      Serial.print(onLine(IR_LEFT));
+      Serial.print(" M ");
+      Serial.print(onLine(IR_MID));
+      Serial.print(" R ");
+      Serial.println(onLine(IR_RIGHT));
+    }
+    return;
+  }
+
+  // ---- section 2: wall following (raw PWM, no encoder speed control) ----
+  if (section == SEC_WALL) {
+    wallLoop();
+    return;
+  }
+
+  // ---- section 1: line following ----
+  updateSpeedControl();  // holds both wheels at whatever drive() last asked for
+
+  if (SPEED_TEST) {
+    drive(BASE, BASE);
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 50) {
+      lastPrint = millis();
+      printSpeeds();
+    }
+    return;
+  }
+
+  bool L = onLine(IR_LEFT);
+  bool M = onLine(IR_MID);
+  bool R = onLine(IR_RIGHT);
+  unsigned long now = millis();
+
+  // Remember the outer sensor that was on most recently, in every mode.
+  if (L || R) lastSide = (L && R) ? 0 : (L ? -1 : 1);
+
+  switch (mode) {
+    case FOLLOWING: lineFollowing(L, M, R, now); break;
+    case TURNING_LEFT:
+    case TURNING_RIGHT: lineTurning(L, M, R, now); break;
+    case STOPPED:
+      stopMotors();
+      if (M) {
+        setMode(FOLLOWING, L, M, R);  // put it back on a line to start again
+        lineLostSince = 0;
+      } else if (lineSectionOver(now)) {
+        startWallSection();
+      }
+      break;
+  }
+}
+
+// ======================= SECTION TRANSITION =======================
+// True once the line code has been STOPPED with no line for LINE_END_MS.
+// Replace this with another cue if the course has one.
+bool lineSectionOver(unsigned long now) {
+  if (lineLostSince == 0) lineLostSince = now;
+  return (now - lineLostSince > LINE_END_MS);
+}
+
+void startWallSection() {
+  stopMotors();
+  lineLostSince = 0;
+  section = SEC_WALL;
+  wallLostCount = 0;
+  setWallState(WALL_IDLE);  // waits until a wall is on the left and the front is clear
+  Serial.println("-> WALL FOLLOWING");
+}
+
+// ======================= LINE FOLLOWING =======================
+void lineFollowing(bool L, bool M, bool R, unsigned long now) {
+  // End of the segment: nothing under any sensor.
+  if (!L && !M && !R) {
+    startTurning(L, M, R, now);
+    return;
+  }
+
+  // An outer sensor (only one) sees the line -> start or extend a brief correction.
+  if (L != R) {
+    int side = L ? -1 : 1;  // -1 = line on the left, +1 = on the right
+    correctDir = STEER_TOWARD_LINE ? side : -side;
+    correctUntil = now + CORRECT_MS;
+  }
+  if (now >= correctUntil) correctDir = 0;  // correction finished, go straight
+
+  // correctDir -1 = curve left (right wheel faster), +1 = curve right.
+  drive(BASE + correctDir * CURVE, BASE - correctDir * CURVE);
+}
+
+// ======================= LINE TURNING =======================
+void startTurning(bool L, bool M, bool R, unsigned long now) {
+  if (lastSide < 0) {
+    setMode(TURNING_LEFT, L, M, R);
+  } else if (lastSide > 0) {
+    setMode(TURNING_RIGHT, L, M, R);
+  } else {
+    setMode(STOPPED, L, M, R);
+    stopMotors();
+    return;
+  }
+  turnStart = now;
+  lineTurning(L, M, R, now);
+}
+
+void lineTurning(bool L, bool M, bool R, unsigned long now) {
+  if (L || M || R) {  // any sensor found the line: stop rotating and adjust
+    correctDir = 0;
+    correctUntil = 0;
+    setMode(FOLLOWING, L, M, R);
+    lineFollowing(L, M, R, now);  // applies the matching correction immediately
+    return;
+  }
+  if (now - turnStart > TURN_TIMEOUT_MS) {  // safety net: spun around and never found it
+    setMode(STOPPED, L, M, R);
+    stopMotors();
+    return;
+  }
+  if (mode == TURNING_LEFT) drive(-TURN_SPEED, TURN_SPEED);  // rotate left in place
+  else drive(TURN_SPEED, -TURN_SPEED);                       // rotate right in place
+}
+
+// ======================= line helpers =======================
+// True if this sensor is over the line.
+bool onLine(int pin) {
+  return digitalRead(pin) == (LINE_IS_HIGH ? HIGH : LOW);
+}
+
+// Change mode and print it (only prints on a change, so serial doesn't slow the loop).
+void setMode(Mode m, bool L, bool M, bool R) {
+  if (m == mode) return;
+  mode = m;
+  const char* names[] = { "LINE FOLLOWING", "LINE TURNING (left)", "LINE TURNING (right)", "STOPPED" };
+  Serial.print(L);
+  Serial.print(M);
+  Serial.print(R);
+  Serial.print(" -> ");
+  Serial.println(names[m]);
+}
+
+// =====================================================================
+// WALL FOLLOWING LOGIC
+// =====================================================================
+void setWallState(WallState s) {
+  wallState = s;
+  wallStateStart = millis();
+}
+
+// Returns distance in cm, or 999 if no echo (nothing in range).
+float readDistanceCm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return 999.0;
+  return duration * 0.0343 / 2.0;  // speed of sound in air, cm/us
+}
+
+// Both wheels forward, PWM clamped to [WALL_MIN_SPEED, 255].
+void wallDrive(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, WALL_MIN_SPEED, 255);
+  rightSpeed = constrain(rightSpeed, WALL_MIN_SPEED, 255);
+  setMotor(L_EN, L_INA, L_INB, leftSpeed * LEFT_DIR);
+  setMotor(R_EN, R_INA, R_INB, rightSpeed * RIGHT_DIR);
+}
+
+// Spin in place to the right (left wheel forward, right wheel backward).
+void wallSpinRight(int speed) {
+  setMotor(L_EN, L_INA, L_INB, speed * LEFT_DIR);
+  setMotor(R_EN, R_INA, R_INB, -speed * RIGHT_DIR);
+}
+
+void wallLoop() {
+  float leftDist = readDistanceCm(LEFT_TRIG, LEFT_ECHO);
+  delay(30);  // let the first ping die out before the next one
+  float frontDist = readDistanceCm(FRONT_TRIG, FRONT_ECHO);
+
+  bool wallPresent = (leftDist < WALL_LOST_CM);
+  unsigned long elapsed = millis() - wallStateStart;
+
+  switch (wallState) {
+
+    case WALL_IDLE:
+      // stay still until a wall is on the left and the front is clear
+      stopMotors();
+      if (wallPresent && frontDist > FRONT_TURN_CM) {
+        wallLostCount = 0;
+        setWallState(WALL_FOLLOW);
+      }
+      break;
+
+    case WALL_FOLLOW:
+      if (frontDist < FRONT_TURN_CM) {
+        // inside corner: wall ahead
+        setWallState(WALL_INSIDE_TURN);
+      } else if (!wallPresent) {
+        // outside corner: wall disappeared (debounced)
+        if (++wallLostCount >= LOST_COUNT_MAX) setWallState(WALL_OUTSIDE_FORWARD);
+      } else {
+        wallLostCount = 0;
+        // P-CONTROLLER
+        // error > 0: too far from wall -> steer left (toward it)
+        // error < 0: too close        -> steer right (away), with stronger gain
+        float error = leftDist - TARGET_DIST_CM;
+        float gain = (error < 0) ? WALL_KP_OUT : WALL_KP;
+        wallLastCorr = constrain((int)(gain * error), -MAX_CORRECTION, MAX_CORRECTION);
+        wallDrive(WALL_LEFT_SPEED - wallLastCorr, WALL_RIGHT_SPEED + wallLastCorr);
+      }
+      break;
+
+    case WALL_INSIDE_TURN:
+      // spin right until the front is clear and the new wall is on the left
+      wallSpinRight(WALL_TURN_SPEED);
+      if (frontDist > FRONT_CLEAR_CM && wallPresent) {
+        wallLostCount = 0;
+        setWallState(WALL_FOLLOW);
+      } else if (elapsed > WALL_TURN_TIMEOUT_MS) {
+        setWallState(WALL_STOPPED);
+      }
+      break;
+
+    case WALL_OUTSIDE_FORWARD:
+      // drive straight so the robot's body clears the corner
+      wallDrive(WALL_LEFT_SPEED, WALL_RIGHT_SPEED);
+      if (frontDist < FRONT_TURN_CM) {
+        setWallState(WALL_INSIDE_TURN);  // something ahead, play it safe
+      } else if (elapsed > OUTSIDE_FORWARD_MS) {
+        setWallState(WALL_OUTSIDE_ARC);
+      }
+      break;
+
+    case WALL_OUTSIDE_ARC:
+      // curve left around the corner until the wall is found again
+      wallDrive(ARC_LEFT_SPEED, ARC_RIGHT_SPEED);
+      if (wallPresent) {
+        wallLostCount = 0;
+        setWallState(WALL_FOLLOW);
+      } else if (frontDist < FRONT_TURN_CM) {
+        setWallState(WALL_INSIDE_TURN);
+      } else if (elapsed > WALL_TURN_TIMEOUT_MS) {
+        setWallState(WALL_STOPPED);
+      }
+      break;
+
+    case WALL_STOPPED:
+      // failsafe: a turn took too long. Stop, then wait for a wall again.
+      stopMotors();
+      wallLostCount = 0;
+      setWallState(WALL_IDLE);
+      break;
+  }
+
+  Serial.print("state: ");
+  Serial.print(wallState);
+  Serial.print("  L: ");
+  Serial.print(leftDist);
+  Serial.print("  F: ");
+  Serial.print(frontDist);
+  Serial.print("  corr: ");
+  Serial.println(wallLastCorr);
+
+  delay(30);
+}
+
+// =====================================================================
+// SPEED CONTROL (line section)
+// =====================================================================
+// Closed-loop wheel speed control using the slotted-disc encoders.
+//
+// The line code only calls:
+//   initSpeedControl()    once, in setup()
+//   updateSpeedControl()  every loop (it runs its own CTRL_MS tick)
+//   drive(left, right)    target wheel speeds in rev/s (negative = backwards)
+//   stopMotors()          targets to 0, PWM off
+//
+// Speed is measured from the time between encoder slots. Per wheel:
+//   PWM = PWM_MIN + KF*target + KP*error + KI*integral(error)
+// The encoders can't sense direction, so measured speed is always positive and
+// direction comes from the sign of the target.
+//
+// Tuning: set SPEED_TEST = true, open Serial Plotter (115200), and watch
+// tgtL/measL/tgtR/measR.
+
+// ---- motor driver pins (L298N) ----
+// Checked with ENC_TEST on 2026-11-06: the L298N's ENA side drives the RIGHT
+// wheel and its ENB side drives the LEFT wheel.
+const int L_EN = 9;
+const int L_INA = 5;
+const int L_INB = 4;
+const int R_EN = 10;
+const int R_INA = 7;
+const int R_INB = 8;
+
+// ---- encoder pins (module D0 outputs, on interrupt pins) ----
+// D3 turns with the left (ENB) motor, D2 with the right (ENA) motor.
+const int ENC_LEFT = 3;
+const int ENC_RIGHT = 2;
+
+// ---- encoder constants ----
+const int PULSES_PER_REV = 20;               // slots in the disc (one RISING edge each)
+const unsigned long ENC_DEBOUNCE_US = 1000;  // ignore edges closer than this (noise); 1 ms = 50 rev/s max
+const unsigned long STALL_US = 250000;       // no pulse for this long = wheel stopped
+
+// ---- controller gains (PWM per rev/s) ----
+const unsigned long CTRL_MS = 20;  // control period
+
+// Feedforward, one value per wheel because the motors differ a lot.
+// If measR sits below its target, raise KF_R; if it overshoots, lower it. Same for KF_L.
+const float KF_L = 94.0;   // (143 - 30) / 1.2
+const float KF_R = 116.0;  // (169 - 30) / 1.2
+const float PWM_MIN = 30.0;       // PWM where the wheel just starts to turn (deadband)
+const float KP = 30.0;            // PWM per rev/s of error
+const float KI = 100.0;           // PWM per (rev/s * s) of accumulated error
+const float I_LIMIT = 150.0;      // max PWM the integral term may add or remove
+const float MEAS_SMOOTH = 0.5;    // 0 = no smoothing, closer to 1 = smoother but laggier
+
+// ---- encoder state (changed inside the interrupts, so volatile) ----
+volatile unsigned long encLastUs[2] = { 0, 0 };    // time of the last pulse
+volatile unsigned long encPeriodUs[2] = { 0, 0 };  // time between the last two pulses (0 = none yet)
+volatile long encCount[2] = { 0, 0 };              // total pulses (unsigned, direction not known)
+
+// ---- controller state, index 0 = left, 1 = right ----
+float tgt[2] = { 0, 0 };   // target speed, rev/s (signed)
+float meas[2] = { 0, 0 };  // measured speed, rev/s (always >= 0)
+float integ[2] = { 0, 0 };
+int pwmOut[2] = { 0, 0 };
+unsigned long lastCtrl = 0;
+
+void onLeftPulse() {
+  encPulse(0);
+}
+
+void onRightPulse() {
+  encPulse(1);
+}
+
+void encPulse(int i) {
+  unsigned long t = micros();
+  unsigned long dt = t - encLastUs[i];
+  if (dt < ENC_DEBOUNCE_US) return;
+  encPeriodUs[i] = dt;
+  encLastUs[i] = t;
+  encCount[i]++;
+}
+
+void initSpeedControl() {
+  pinMode(L_EN, OUTPUT);
+  pinMode(R_EN, OUTPUT);
+  pinMode(L_INA, OUTPUT);
+  pinMode(L_INB, OUTPUT);
+  pinMode(R_INA, OUTPUT);
+  pinMode(R_INB, OUTPUT);
+  pinMode(ENC_LEFT, INPUT);
+  pinMode(ENC_RIGHT, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT), onLeftPulse, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT), onRightPulse, RISING);
+  stopMotors();
+  lastCtrl = millis();
+}
+
+// Set target wheel speeds in rev/s. Negative = backwards.
+void drive(float left, float right) {
+  setTarget(0, left);
+  setTarget(1, right);
+}
+
+void stopMotors() {
+  drive(0, 0);
+  analogWrite(L_EN, 0);
+  analogWrite(R_EN, 0);
+  pwmOut[0] = pwmOut[1] = 0;
+}
+
+void setTarget(int i, float t) {
+  // Reversing or stopping: the old integral is for the other direction, drop it.
+  if (t == 0 || (t > 0) != (tgt[i] > 0)) integ[i] = 0;
+  tgt[i] = t;
+}
+
+// Current speed of one wheel in rev/s, from the time between encoder pulses.
+float readSpeed(int i) {
+  noInterrupts();
+  unsigned long last = encLastUs[i];
+  unsigned long period = encPeriodUs[i];
+  interrupts();
+  unsigned long since = micros() - last;
+  if (period == 0 || since > STALL_US) return 0;
+  if (since > period) period = since;  // overdue pulse: we're at most this fast
+  return 1e6 / (float)period / PULSES_PER_REV;
+}
+
+// Call every loop. Does nothing until CTRL_MS has passed.
+void updateSpeedControl() {
+  unsigned long now = millis();
+  if (now - lastCtrl < CTRL_MS) return;
+  float dt = (now - lastCtrl) / 1000.0;
+  lastCtrl = now;
+
+  for (int i = 0; i < 2; i++) {
+    meas[i] = MEAS_SMOOTH * meas[i] + (1 - MEAS_SMOOTH) * readSpeed(i);
+    float target = fabs(tgt[i]);
+    if (target == 0) {
+      pwmOut[i] = 0;
+      integ[i] = 0;
+      continue;
+    }
+    float err = target - meas[i];
+    integ[i] += err * dt;
+    integ[i] = constrain(integ[i], -I_LIMIT / KI, I_LIMIT / KI);  // anti-windup
+    float kf = (i == 0) ? KF_L : KF_R;                            // per-wheel feedforward
+    float pwm = PWM_MIN + kf * target + KP * err + KI * integ[i];
+    pwmOut[i] = (int)constrain(pwm, 0, 255);
+  }
+  setMotor(L_EN, L_INA, L_INB, tgt[0] >= 0 ? pwmOut[0] : -pwmOut[0]);
+  setMotor(R_EN, R_INA, R_INB, tgt[1] >= 0 ? pwmOut[1] : -pwmOut[1]);
+}
+
+// One line for Serial Plotter: targets vs measured (rev/s) and the PWM sent.
+void printSpeeds() {
+  Serial.print("tgtL:");
+  Serial.print(fabs(tgt[0]), 2);
+  Serial.print(",measL:");
+  Serial.print(meas[0], 2);
+  Serial.print(",tgtR:");
+  Serial.print(fabs(tgt[1]), 2);
+  Serial.print(",measR:");
+  Serial.print(meas[1], 2);
+  Serial.print(",pwmL:");
+  Serial.print(pwmOut[0] / 100.0, 2);  // /100 so it fits the same scale
+  Serial.print(",pwmR:");
+  Serial.println(pwmOut[1] / 100.0, 2);
+}
+
+// Wiring check (ENC_TEST = true). No speed control here: it drives ONE motor at a
+// time at a fixed PWM and prints how many pulses per second each encoder pin sees.
+// phase 1: LEFT motor at PWM 90, then PWM 200
+// phase 2: RIGHT motor at PWM 90, then PWM 200
+void runEncoderTest() {
+  const char* names[] = { "LEFT motor PWM 90", "LEFT motor PWM 200",
+                          "stopped", "RIGHT motor PWM 90", "RIGHT motor PWM 200",
+                          "stopped" };
+  const unsigned long PHASE_MS = 2500;
+  static int phase = -1;
+  static unsigned long phaseStart = 0, lastPrint = 0;
+  static long lastC[2] = { 0, 0 };
+  unsigned long now = millis();
+
+  if (phase < 0 || now - phaseStart >= PHASE_MS) {
+    phase = (phase + 1) % 6;
+    phaseStart = now;
+    setMotor(L_EN, L_INA, L_INB, phase == 0 ? 90 : phase == 1 ? 200
+                                                              : 0);
+    setMotor(R_EN, R_INA, R_INB, phase == 3 ? 90 : phase == 4 ? 200
+                                                              : 0);
+    Serial.print("---- ");
+    Serial.print(names[phase]);
+    Serial.println(" ----");
+  }
+
+  if (now - lastPrint >= 500) {
+    float dt = (now - lastPrint) / 1000.0;
+    lastPrint = now;
+    noInterrupts();
+    long c0 = encCount[0], c1 = encCount[1];
+    interrupts();
+    Serial.print(" D");
+    Serial.print(ENC_LEFT);
+    Serial.print(" pulses/s: ");
+    Serial.print((c0 - lastC[0]) / dt, 0);
+    Serial.print(" D");
+    Serial.print(ENC_RIGHT);
+    Serial.print(" pulses/s: ");
+    Serial.println((c1 - lastC[1]) / dt, 0);
+    lastC[0] = c0;
+    lastC[1] = c1;
+  }
+}
+
+void setMotor(int en, int inA, int inB, int speed) {
+  digitalWrite(inA, speed >= 0 ? HIGH : LOW);  // direction from the sign
+  digitalWrite(inB, speed >= 0 ? LOW : HIGH);
+  analogWrite(en, constrain(abs(speed), 0, 255));  // speed from the size
+}
